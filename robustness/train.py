@@ -516,3 +516,4 @@ def _model_loop(args, loop_type, loader, model, opt, epoch, adv, writer):
 
     return top1.avg, losses.avg
 
+# changes committing checkpoint
