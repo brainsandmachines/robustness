@@ -18,8 +18,10 @@ if int(os.environ.get("NOTEBOOK_MODE", 0)) == 1:
 else:
     from tqdm import tqdm as tqdm
 
-# Replace apex import with torch.cuda.amp
-# No explicit import needed - torch.cuda.amp is built-in
+try:
+    from apex import amp
+except Exception as e:
+    warnings.warn('Could not import amp.')
 
 def check_required_args(args, eval_only=False):
     """
@@ -80,11 +82,9 @@ def make_optimizer_and_schedule(args, model, checkpoint, params):
     optimizer = SGD(param_list, args.lr, momentum=args.momentum,
                                 weight_decay=args.weight_decay)
 
-    # Initialize GradScaler for mixed precision
-    scaler = None
     if args.mixed_precision:
         model.to('cuda')
-        scaler = ch.amp.GradScaler("cuda")
+        model, optimizer = amp.initialize(model, optimizer, 'O1')
 
     # Make schedule
     schedule = None
@@ -118,15 +118,15 @@ def make_optimizer_and_schedule(args, model, checkpoint, params):
             for i in range(steps_to_take):
                 schedule.step()
         
-        if 'scaler' in checkpoint and checkpoint['scaler'] not in [None, 'N/A'] and scaler is not None:
-            scaler.load_state_dict(checkpoint['scaler'])
+        if 'amp' in checkpoint and checkpoint['amp'] not in [None, 'N/A']:
+            amp.load_state_dict(checkpoint['amp'])
 
         # TODO: see if there's a smarter way to do this
         # TODO: see what's up with loading fp32 weights and then MP training
         if args.mixed_precision:
             model.load_state_dict(checkpoint['model'])
 
-    return optimizer, schedule, scaler
+    return optimizer, schedule
 
 def eval_model(args, model, loader, store):
     """
@@ -151,14 +151,14 @@ def eval_model(args, model, loader, store):
     model = ch.nn.DataParallel(model)
 
     prec1, nat_loss = _model_loop(args, 'val', loader, 
-                                        model, None, 0, False, writer, None)
+                                        model, None, 0, False, writer)
 
     adv_prec1, adv_loss = float('nan'), float('nan')
     if args.adv_eval: 
         args.eps = eval(str(args.eps)) if has_attr(args, 'eps') else None
         args.attack_lr = eval(str(args.attack_lr)) if has_attr(args, 'attack_lr') else None
         adv_prec1, adv_loss = _model_loop(args, 'val', loader, 
-                                        model, None, 0, True, writer, None)
+                                        model, None, 0, True, writer)
     log_info = {
         'epoch':0,
         'nat_prec1':prec1,
@@ -291,7 +291,7 @@ def train_model(args, model, loaders, *, checkpoint=None, dp_device_ids=None,
 
     # Initial setup
     train_loader, val_loader = loaders
-    opt, schedule, scaler = make_optimizer_and_schedule(args, model, checkpoint, update_params)
+    opt, schedule = make_optimizer_and_schedule(args, model, checkpoint, update_params)
 
     # Put the model into parallel mode
     assert not hasattr(model, "module"), "model is already in DataParallel."
@@ -301,7 +301,7 @@ def train_model(args, model, loaders, *, checkpoint=None, dp_device_ids=None,
     if checkpoint:
         start_epoch = checkpoint['epoch']
         best_prec1 = checkpoint[prec1_key] if prec1_key in checkpoint \
-            else _model_loop(args, 'val', val_loader, model, None, start_epoch-1, args.adv_train, writer=None, scaler=scaler)[0]
+            else _model_loop(args, 'val', val_loader, model, None, start_epoch-1, args.adv_train, writer=None)[0]
 
     # Timestamp for training start time
     start_time = time.time()
@@ -309,7 +309,7 @@ def train_model(args, model, loaders, *, checkpoint=None, dp_device_ids=None,
     for epoch in range(start_epoch, args.epochs):
         # train for one epoch
         train_prec1, train_loss = _model_loop(args, 'train', train_loader, 
-                model, opt, epoch, args.adv_train, writer, scaler)
+                model, opt, epoch, args.adv_train, writer)
         last_epoch = (epoch == (args.epochs - 1))
 
         # evaluate on validation set
@@ -318,7 +318,7 @@ def train_model(args, model, loaders, *, checkpoint=None, dp_device_ids=None,
             'optimizer':opt.state_dict(),
             'schedule':(schedule and schedule.state_dict()),
             'epoch': epoch+1,
-            'scaler': scaler.state_dict() if args.mixed_precision and scaler is not None else None,
+            'amp': amp.state_dict() if args.mixed_precision else None,
         }
 
 
@@ -336,12 +336,12 @@ def train_model(args, model, loaders, *, checkpoint=None, dp_device_ids=None,
             ctx = ch.enable_grad() if disable_no_grad else ch.no_grad() 
             with ctx:
                 prec1, nat_loss = _model_loop(args, 'val', val_loader, model, 
-                        None, epoch, False, writer, scaler)
+                        None, epoch, False, writer)
 
             # loader, model, epoch, input_adv_exs
             should_adv_eval = args.adv_eval or args.adv_train
             adv_val = should_adv_eval and _model_loop(args, 'val', val_loader,
-                    model, None, epoch, True, writer, scaler)
+                    model, None, epoch, True, writer)
             adv_prec1, adv_loss = adv_val or (-1.0, -1.0)
 
             # remember best prec@1 and save checkpoint
@@ -376,7 +376,7 @@ def train_model(args, model, loaders, *, checkpoint=None, dp_device_ids=None,
 
     return model
 
-def _model_loop(args, loop_type, loader, model, opt, epoch, adv, writer, scaler):
+def _model_loop(args, loop_type, loader, model, opt, epoch, adv, writer):
     """
     *Internal function* (refer to the train_model and eval_model functions for
     how to train and evaluate models).
@@ -394,7 +394,6 @@ def _model_loop(args, loop_type, loader, model, opt, epoch, adv, writer, scaler)
         epoch (int) : which epoch we are currently on
         adv (bool) : whether to evaluate adversarially (otherwise standard)
         writer : tensorboardX writer (optional)
-        scaler : GradScaler for mixed precision training (optional)
 
     Returns:
         The average top1 accuracy and the average loss across the epoch.
@@ -445,17 +444,9 @@ def _model_loop(args, loop_type, loader, model, opt, epoch, adv, writer, scaler)
     for i, (inp, target) in iterator:
        # measure data loading time
         target = target.cuda(non_blocking=True)
-        
-        # Use autocast for mixed precision forward pass
-        if args.mixed_precision and scaler is not None:
-            with ch.amp.autocast("cuda"):
-                output, final_inp = model(inp, target=target, make_adv=adv,
-                                          **attack_kwargs)
-                loss = train_criterion(output, target)
-        else:
-            output, final_inp = model(inp, target=target, make_adv=adv,
-                                      **attack_kwargs)
-            loss = train_criterion(output, target)
+        output, final_inp = model(inp, target=target, make_adv=adv,
+                                  **attack_kwargs)
+        loss = train_criterion(output, target)
 
         if len(loss.shape) > 0: loss = loss.mean()
 
@@ -489,14 +480,12 @@ def _model_loop(args, loop_type, loader, model, opt, epoch, adv, writer, scaler)
         # compute gradient and do SGD step
         if is_train:
             opt.zero_grad()
-            if args.mixed_precision and scaler is not None:
-                # Use GradScaler for backward and optimizer step
-                scaler.scale(loss).backward()
-                scaler.step(opt)
-                scaler.update()
+            if args.mixed_precision:
+                with amp.scale_loss(loss, opt) as sl:
+                    sl.backward()
             else:
                 loss.backward()
-                opt.step()
+            opt.step()
         elif adv and i == 0 and writer:
             # add some examples to the tensorboard
             nat_grid = make_grid(inp[:15, ...])
@@ -526,3 +515,4 @@ def _model_loop(args, loop_type, loader, model, opt, epoch, adv, writer, scaler)
                               epoch)
 
     return top1.avg, losses.avg
+

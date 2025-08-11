@@ -1,35 +1,8 @@
-"""
-**For most use cases, this can just be considered an internal class and
-ignored.**
-
-This module houses the :class:`robustness.attacker.Attacker` and
-:class:`robustness.attacker.AttackerModel` classes. 
-
-:class:`~robustness.attacker.Attacker` is an internal class that should not be
-imported/called from outside the library.
-:class:`~robustness.attacker.AttackerModel` is a "wrapper" class which is fed a
-model and adds to it adversarial attack functionalities as well as other useful
-options. See :meth:`robustness.attacker.AttackerModel.forward` for documentation
-on which arguments AttackerModel supports, and see
-:meth:`robustness.attacker.Attacker.forward` for the arguments pertaining to
-adversarial examples specifically.
-
-For a demonstration of this module in action, see the walkthrough
-":doc:`../example_usage/input_space_manipulation`"
-
-**Note 1**: :samp:`.forward()` should never be called directly but instead the
-AttackerModel object itself should be called, just like with any
-:samp:`nn.Module` subclass.
-
-**Note 2**: Even though the adversarial example arguments are documented in
-:meth:`robustness.attacker.Attacker.forward`, this function should never be
-called directly---instead, these arguments are passed along from
-:meth:`robustness.attacker.AttackerModel.forward`.
-"""
-
 import torch as ch
-import dill
+import torch.nn as nn
+import time
 import os
+
 if int(os.environ.get("NOTEBOOK_MODE", 0)) == 1:
     from tqdm import tqdm_notebook as tqdm
 else:
@@ -84,8 +57,8 @@ class Attacker(ch.nn.Module):
             x, target (ch.tensor) : see :meth:`robustness.attacker.AttackerModel.forward`
             constraint
                 ("2"|"inf"|"unconstrained"|"fourier"|:class:`~robustness.attack_steps.AttackerStep`)
-                : threat model for adversarial attacks (:math:`\ell_2` ball,
-                :math:`\ell_\infty` ball, :math:`[0, 1]^n`, Fourier basis, or
+                : threat model for adversarial attacks (:math:`\\ell_2` ball,
+                :math:`\\ell_\\infty` ball, :math:`[0, 1]^n`, Fourier basis, or
                 custom AttackerStep subclass).
             eps (float) : radius for threat model.
             step_size (float) : step size for adversarial attacks.
@@ -115,11 +88,11 @@ class Attacker(ch.nn.Module):
             est_grad (tuple|None) : If not None (default), then these are
                 :samp:`(query_radius [R], num_queries [N])` to use for estimating the
                 gradient instead of autograd. We use the spherical gradient
-                estimator, shown below, along with antithetic sampling [#f1]_
+                estimator, shown below, along with antithetic sampling [#f1]_ 
                 to reduce variance:
-                :math:`\\nabla_x f(x) \\approx \\sum_{i=0}^N f(x + R\\cdot
-                \\vec{\\delta_i})\\cdot \\vec{\\delta_i}`, where
-                :math:`\delta_i` are randomly sampled from the unit ball.
+                :math:`\\\\nabla_x f(x) \\\\approx \\\\sum_{i=0}^N f(x + R\\\\cdot
+                \\\\vec{\\\\delta_i})\\\\cdot \\\\vec{\\\\delta_i}`, where
+                :math:`\\delta_i` are randomly sampled from the unit ball.
             mixed_precision (bool) : if True, use mixed-precision calculations
                 to compute the adversarial examples / do the inference.
         Returns:
@@ -130,8 +103,8 @@ class Attacker(ch.nn.Module):
             *  not `target` (if `targeted == False`)
 
         .. [#f1] This means that we actually draw :math:`N/2` random vectors
-            from the unit ball, and then use :math:`\delta_{N/2+i} =
-            -\delta_{i}`.
+            from the unit ball, and then use :math:`\\delta_{N/2+i} =
+            -\\delta_{i}`.
         """
         # Can provide a different input to make the feasible set around
         # instead of the initial point
@@ -153,178 +126,152 @@ class Attacker(ch.nn.Module):
             '''
             if should_normalize:
                 inp = self.normalize(inp)
-            output = self.model(inp)
+
             if custom_loss:
                 return custom_loss(self.model, inp, target)
+            else:
+                output = self.model(inp)
+                return criterion(output, target), output
 
-            return criterion(output, target), output
-
-        # Main function for making adversarial examples
-        def get_adv_examples(x):
-            # Random start (to escape certain types of gradient masking)
-            if random_start:
-                x = step.random_perturb(x)
-
-            iterator = range(iterations)
-            if do_tqdm: iterator = tqdm(iterator)
-
-            # Keep track of the "best" (worst-case) loss and its
-            # corresponding input
-            best_loss = None
-            best_x = None
-
-            # A function that updates the best loss and best input
-            def replace_best(loss, bloss, x, bx):
-                if bloss is None:
-                    bx = x.clone().detach()
-                    bloss = loss.clone().detach()
-                else:
-                    replace = m * bloss < m * loss
-                    bx[replace] = x[replace].clone().detach()
-                    bloss[replace] = loss[replace]
-
-                return bloss, bx
-
-            # PGD iterates
-            for _ in iterator:
-                x = x.clone().detach().requires_grad_(True)
-                losses, out = calc_loss(step.to_image(x), target)
-                assert losses.shape[0] == x.shape[0], \
-                        'Shape of losses must match input!'
-
-                loss = ch.mean(losses)
-
-                if step.use_grad:
-                    if (est_grad is None) and mixed_precision:
-                        with amp.scale_loss(loss, []) as sl:
-                            sl.backward()
-                        grad = x.grad.detach()
-                        x.grad.zero_()
-                    elif (est_grad is None):
-                        grad, = ch.autograd.grad(m * loss, [x])
-                    else:
-                        f = lambda _x, _y: m * calc_loss(step.to_image(_x), _y)[0]
-                        grad = helpers.calc_est_grad(f, x, target, *est_grad)
-                else:
-                    grad = None
-
-                with ch.no_grad():
-                    args = [losses, best_loss, x, best_x]
-                    best_loss, best_x = replace_best(*args) if use_best else (losses, x)
-
-                    x = step.step(x, grad)
-                    x = step.project(x)
-                    if do_tqdm: iterator.set_description("Current loss: {l}".format(l=loss))
-
-            # Save computation (don't compute last loss) if not use_best
-            if not use_best: 
-                ret = x.clone().detach()
-                return step.to_image(ret) if return_image else ret
-
-            losses, _ = calc_loss(step.to_image(x), target)
-            args = [losses, best_loss, x, best_x]
-            best_loss, best_x = replace_best(*args)
-            return step.to_image(best_x) if return_image else best_x
-
-        # Random restarts: repeat the attack and find the worst-case
-        # example for each input in the batch
+        # Main attack loop
         if random_restarts:
             to_ret = None
-
             orig_cpy = x.clone().detach()
             for _ in range(random_restarts):
-                adv = get_adv_examples(orig_cpy)
-
+                x = orig_cpy.clone().detach()
+                x = self.forward(x, target, constraint=constraint, eps=eps,
+                    step_size=step_size, iterations=iterations, random_start=True,
+                    random_restarts=0, do_tqdm=do_tqdm, targeted=targeted,
+                    custom_loss=custom_loss, should_normalize=should_normalize,
+                    orig_input=orig_input, use_best=use_best, return_image=return_image,
+                    est_grad=est_grad, mixed_precision=mixed_precision)
+                
                 if to_ret is None:
-                    to_ret = adv.detach()
+                    to_ret = x
+                else:
+                    _, output = calc_loss(x, target)
+                    _, best_output = calc_loss(to_ret, target)
+                    replace = m * best_output < m * output
+                    to_ret = ch.where(replace.view(-1, *([1] * (len(x.shape) - 1))), x, to_ret)
+            
+            return to_ret
 
-                _, output = calc_loss(adv, target)
-                corr, = helpers.accuracy(output, target, topk=(1,), exact=True)
-                corr = corr.byte()
-                misclass = ~corr
-                to_ret[misclass] = adv[misclass]
+        if random_start:
+            x = step.random_perturb(x)
 
-            adv_ret = to_ret
-        else:
-            adv_ret = get_adv_examples(x)
+        iterator = range(iterations)
+        if do_tqdm: iterator = tqdm(iterator)
 
-        return adv_ret
+        # Keep track of the "best" (worst-case) loss and its
+        # corresponding input
+        best_loss = None
+        best_x = None
+
+        # A function that updates the best loss and best input
+        def replace_best(loss, bloss, x, bx):
+            if bloss is None:
+                bx = x.clone().detach()
+                bloss = loss.clone().detach()
+            else:
+                replace = m * bloss < m * loss
+                bx[replace] = x[replace].clone().detach()
+                bloss[replace] = loss[replace]
+
+            return bloss, bx
+
+        # PGD iterates
+        for _ in iterator:
+            x = x.clone().detach().requires_grad_(True)
+            losses, out = calc_loss(step.to_image(x), target)
+            assert losses.shape[0] == x.shape[0], \
+                    'Shape of losses must match input!'
+
+            loss = ch.mean(losses)
+
+            if step.use_grad:
+                if (est_grad is None) and mixed_precision:
+                    # Use torch.amp GradScaler for mixed precision
+                    scaler = ch.amp.GradScaler("cuda")
+                    with ch.amp.autocast("cuda"):
+                        pass  # Forward pass already done
+                    # Scale and backward
+                    scaler.scale(loss).backward()
+                    grad = x.grad.detach()
+                    x.grad.zero_()
+                elif (est_grad is None):
+                    grad, = ch.autograd.grad(m * loss, [x])
+                else:
+                    f = lambda _x, _y: m * calc_loss(step.to_image(_x), _y)[0]
+                    grad = helpers.calc_est_grad(f, x, target, *est_grad)
+            else:
+                grad = None
+
+            with ch.no_grad():
+                args = [losses, best_loss, x, best_x]
+                best_loss, best_x = replace_best(*args) if use_best else (losses, x)
+
+                x = step.step(x, grad)
+                x = step.project(x)
+                if do_tqdm: iterator.set_description("Current loss: {l}".format(l=loss))
+
+        # Save computation (don't compute last loss) if not use_best
+        if not use_best: 
+            ret = x.clone().detach()
+            return step.to_image(ret) if return_image else ret
+
+        losses, _ = calc_loss(step.to_image(x), target)
+        args = [losses, best_loss, x, best_x]
+        best_loss, best_x = replace_best(*args)
+        return step.to_image(best_x) if return_image else best_x
+
 
 class AttackerModel(ch.nn.Module):
-    """
-    Wrapper class for adversarial attacks on models. Given any normal
-    model (a ``ch.nn.Module`` instance), wrapping it in AttackerModel allows
-    for convenient access to adversarial attacks and other applications.::
+    def __init__(self, model, dataset, **kwargs):
+        """
+        Wrapper for any PyTorch model as an AttackerModel, which is 
+        necessary for adversarial training and evaluation. 
 
-        model = ResNet50()
-        model = AttackerModel(model)
-        x = ch.rand(10, 3, 32, 32) # random images
-        y = ch.zeros(10) # label 0
-        out, new_im = model(x, y, make_adv=True) # adversarial attack
-        out, new_im = model(x, y, make_adv=True, targeted=True) # targeted attack
-        out = model(x) # normal inference (no label needed)
-
-    More code examples available in the documentation for `forward`.
-    For a more comprehensive overview of this class, see 
-    :doc:`our detailed walkthrough <../example_usage/input_space_manipulation>`.
-    """
-    def __init__(self, model, dataset):
+        Args:
+            model (nn.Module) : the model to wrap
+            dataset : the dataset that the model is trained on, only used to get
+            mean and std for data normalization
+        """
         super(AttackerModel, self).__init__()
-        self.normalizer = helpers.InputNormalize(dataset.mean, dataset.std)
         self.model = model
         self.attacker = Attacker(model, dataset)
 
     def forward(self, inp, target=None, make_adv=False, with_latent=False,
                 fake_relu=False, no_relu=False, with_image=True, **attacker_kwargs):
         """
-        Main function for running inference and generating adversarial
-        examples for a model.
-
-        Parameters:
-            inp (ch.tensor) : input to do inference on [N x input_shape] (e.g. NCHW)
-            target (ch.tensor) : ignored if `make_adv == False`. Otherwise,
-                labels for adversarial attack.
-            make_adv (bool) : whether to make an adversarial example for
-                the model. If true, returns a tuple of the form
-                :samp:`(model_prediction, adv_input)` where
-                :samp:`model_prediction` is a tensor with the *logits* from
-                the network.
-            with_latent (bool) : also return the second-last layer along
-                with the logits. Output becomes of the form
-                :samp:`((model_logits, model_layer), adv_input)` if
-                :samp:`make_adv==True`, otherwise :samp:`(model_logits, model_layer)`.
-            fake_relu (bool) : useful for activation maximization. If
-                :samp:`True`, replace the ReLUs in the last layer with
-                "fake ReLUs," which are ReLUs in the forwards pass but
-                identity in the backwards pass (otherwise, maximizing a
-                ReLU which is dead is impossible as there is no gradient).
-            no_relu (bool) : If :samp:`True`, return the latent output with
-                the (pre-ReLU) output of the second-last layer, instead of the
-                post-ReLU output. Requires :samp:`fake_relu=False`, and has no
-                visible effect without :samp:`with_latent=True`.
-            with_image (bool) : if :samp:`False`, only return the model output
-                (even if :samp:`make_adv == True`).
-
+        Args:
+            inp : input to do inference on
+            target (ch.tensor) : the labels of the input, used to make adversarial
+                examples if desired
+            make_adv (bool) : whether to make the input adversarial 
+            with_latent (bool) : also return the second-to-last layer along
+                with the logits
+            fake_relu (bool) : replace ReLUs with incrementally smoothed
+               versions for compatibility with TRADES and other defenses
+            no_relu (bool) : remove all ReLUs for compatibility with TRADES
+                and other defenses (see `here 
+                <https://github.com/yaodongyu/TRADES/blob/master/models/small_cnn.py>`_
+                for an example of how to do this)
+            with_image (bool) : also return the image that was classified in
+                addition to the logits
+        Returns:
+            logits : a tensor of shape [N, num_classes] with the logits from
+            the model.
+            latent_representation : (if with_latent=True) a tensor of 
+            shape [N, D] where D is the second-to-last layer width.
+            inp_adv : (if with_image=True) the image that was classified.
         """
+
         if make_adv:
-            assert target is not None
-            prev_training = bool(self.training)
-            self.eval()
-            adv = self.attacker(inp, target, **attacker_kwargs)
-            if prev_training:
-                self.train()
+            inp = self.attacker(inp, target, **attacker_kwargs)
 
-            inp = adv
+        output = self.model(inp)
 
-        normalized_inp = self.normalizer(inp)
-
-        if no_relu and (not with_latent):
-            print("WARNING: 'no_relu' has no visible effect if 'with_latent is False.")
-        if no_relu and fake_relu:
-            raise ValueError("Options 'no_relu' and 'fake_relu' are exclusive")
-
-        output = self.model(normalized_inp, with_latent=with_latent,
-                                fake_relu=fake_relu, no_relu=no_relu)
-        if with_image:
-            return (output, inp)
-        return output
+        if with_latent:
+            return output, self.model.latent, inp if with_image else None
+        else:
+            return (output, inp) if with_image else output
