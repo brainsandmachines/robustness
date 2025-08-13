@@ -20,6 +20,22 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 from . import imagenet_models as models
 
+def _load_imagenet_label_mapping(map_file):
+    """
+    Returns a dict: {wnid (e.g., 'n01440764'): class_index (int)}
+    built from ILSVRC2012 map_clsloc.txt lines like:
+    '0 n01440764 tench'
+    """
+    wnid_to_index = {}
+    with open(map_file, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                idx = int(parts[0])
+                wnid = parts[1]
+                wnid_to_index[wnid] = idx
+    return wnid_to_index
+
 def make_loaders(workers, batch_size, transforms, data_path, data_aug=True,
                 custom_class=None, dataset="", label_mapping=None, subset=None,
                 subset_type='rand', subset_start=0, val_batch_size=None,
@@ -52,7 +68,14 @@ def make_loaders(workers, batch_size, transforms, data_path, data_aug=True,
 
         if not os.path.exists(test_path):
             raise ValueError("Test data must be stored in dataset/test or {0}".format(test_path))
-
+        if (dataset == 'imagenet') and (label_mapping is None):
+        # First try inside the dataset root (common place to keep the devkit files)
+            map_file = os.path.join(data_path, 'map_clsloc.txt')
+            if os.path.exists(map_file):
+                print(f"Using official ImageNet class order from: {map_file}")
+                label_mapping = _load_imagenet_label_mapping(map_file)
+            else:
+                print("WARNING: map_clsloc.txt not found; falling back to alphabetical folder order.")
         if not only_val:
             train_set = folder.ImageFolder(root=train_path, transform=transform_train,
                                            label_mapping=label_mapping)

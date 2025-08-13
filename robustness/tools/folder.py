@@ -2,13 +2,14 @@ import torch.utils.data as data
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-from PIL import Image
+from PIL import Image, ImageFile
 
 import os
 import os.path
 import sys
 
-
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+Image.MAX_IMAGE_PIXELS = None
 def has_file_allowed_extension(filename, extensions):
     """Checks if a file is an allowed extension.
 
@@ -164,6 +165,11 @@ def pil_loader(path):
     # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
     with open(path, 'rb') as f:
         img = Image.open(f)
+        try:
+            img.load()
+        except OSError as e:   
+            print(f"[WARN] Truncated/corrupt image encountered: {path} ({e})")
+        
         return img.convert('RGB')
 
 
