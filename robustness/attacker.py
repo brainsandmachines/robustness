@@ -39,7 +39,7 @@ from .tools import helpers
 from . import attack_steps
 
 import torch as ch
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 STEPS = {
     'inf': attack_steps.LinfStep,
@@ -191,7 +191,7 @@ class Attacker(ch.nn.Module):
             # PGD iterates
             for _ in iterator:
                 x = x.clone().detach().requires_grad_(True)
-                with autocast(enabled=bool(mixed_precision)):
+                with autocast('cuda', enabled=bool(mixed_precision)):
                     losses, out = calc_loss(step.to_image(x), target)
                 assert losses.shape[0] == x.shape[0], \
                         'Shape of losses must match input!'

@@ -1,2 +1,2 @@
-import torch
-print(torch.__version__)
+import numpy as np
+print(np.__version__)
