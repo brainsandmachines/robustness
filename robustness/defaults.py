@@ -136,7 +136,17 @@ Arguments for main.py specifically
 *Format*: `[NAME, TYPE/CHOICES, HELP STRING, DEFAULT (REQ=required,
 BY_DATASET=looked up in TRAINING_DEFAULTS at runtime)]`
 """
+DISTRIBUTED_ARGS = [
+    ['distributed', [0, 1], 'Use distributed training (DDP)', 0],
+    ['world-size', int, 'Number of processes for distributed training (default: number of GPUs)', None],
+    ['dist-backend', ['nccl', 'gloo'], 'Distributed backend (nccl or gloo)', 'nccl'],
+    ['dist-url', str, 'URL for distributed training coordination', 'env://']
+]
+"""
+Arguments for distributed training.
 
+*Format*: `[NAME, TYPE/CHOICES, HELP STRING, DEFAULT]`
+"""
 def add_args_to_parser(arg_list, parser):
     """
     Adds arguments from one of the argument lists above to a passed-in

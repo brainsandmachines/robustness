@@ -121,7 +121,8 @@ class DataSet(object):
 
     def make_loaders(self, workers, batch_size, data_aug=True, subset=None, 
                     subset_start=0, subset_type='rand', val_batch_size=None,
-                    only_val=False, shuffle_train=True, shuffle_val=True, subset_seed=None):
+                    only_val=False, shuffle_train=True, shuffle_val=True, subset_seed=None,
+                    distributed=False, rank=0, world_size=1):
         '''
         Args:
             workers (int) : number of workers for data fetching (*required*).
@@ -168,6 +169,9 @@ class DataSet(object):
                                     val_batch_size=val_batch_size,
                                     subset=subset,
                                     subset_start=subset_start,
+                                    distributed=distributed,
+                                    rank=rank,
+                                    world_size=world_size,
                                     subset_type=subset_type,
                                     only_val=only_val,
                                     seed=subset_seed,

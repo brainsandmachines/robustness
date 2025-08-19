@@ -8,11 +8,6 @@ from cox.utils import Parameters
 from .tools import helpers
 from .tools.helpers import AverageMeter, ckpt_at_epoch, has_attr
 from .tools import constants as consts
-from .tools.distributed_utils import (
-    is_distributed, get_rank, get_world_size, is_main_process, 
-    barrier, reduce_tensor
-)
-from torch.nn.parallel import DistributedDataParallel as DDP
 import dill 
 import os
 import time
@@ -80,17 +75,9 @@ def make_optimizer_and_schedule(args, model, checkpoint, params):
         An optimizer (ch.nn.optim.Optimizer) and a scheduler
             (ch.nn.optim.lr_schedulers module).
     """
-    # Make optimizer with distributed learning rate scaling
+    # Make optimizer
     param_list = model.parameters() if params is None else params
-    
-    # Scale learning rate for distributed training
-    lr = args.lr
-    if is_distributed():
-        lr = args.lr * get_world_size()  # Linear scaling rule
-        if is_main_process():
-            print(f"Scaling learning rate for {get_world_size()} processes: {args.lr} -> {lr}")
-    
-    optimizer = SGD(param_list, lr, momentum=args.momentum,
+    optimizer = SGD(param_list, args.lr, momentum=args.momentum,
                                 weight_decay=args.weight_decay)
 
     # Initialize GradScaler for mixed precision
@@ -160,11 +147,8 @@ def eval_model(args, model, loader, store):
         store.add_table(consts.LOGS_TABLE, consts.LOGS_SCHEMA)
     writer = store.tensorboard if store else None
 
-    assert not hasattr(model, "module"), "model is already wrapped for parallel training."
-    if is_distributed():
-        model = DDP(model, device_ids=[get_rank()])
-    else:
-        model = ch.nn.DataParallel(model)
+    assert not hasattr(model, "module"), "model is already in DataParallel."
+    model = ch.nn.DataParallel(model)
 
     prec1, nat_loss = _model_loop(args, 'val', loader, 
                                         model, None, 0, False, writer, None)
@@ -191,7 +175,7 @@ def eval_model(args, model, loader, store):
     return log_info
 
 def train_model(args, model, loaders, *, checkpoint=None, dp_device_ids=None,
-            store=None, update_params=None, disable_no_grad=False, distributed=None):
+            store=None, update_params=None, disable_no_grad=False):
     """
     Main function for training a model. 
 
@@ -310,16 +294,8 @@ def train_model(args, model, loaders, *, checkpoint=None, dp_device_ids=None,
     opt, schedule, scaler = make_optimizer_and_schedule(args, model, checkpoint, update_params)
 
     # Put the model into parallel mode
-    # Put the model into parallel mode
-    assert not hasattr(model, "module"), "model is already wrapped for parallel training."
-    if is_distributed():
-        # DDP mode: each process gets its own GPU
-        device_id = get_rank() if ch.cuda.is_available() else None
-        model = model.cuda(device_id) if device_id is not None else model
-        model = DDP(model, device_ids=[device_id] if device_id is not None else None)
-    else:
-        # DataParallel fallback for single-process multi-GPU
-        model = ch.nn.DataParallel(model, device_ids=dp_device_ids).cuda()
+    assert not hasattr(model, "module"), "model is already in DataParallel."
+    model = ch.nn.DataParallel(model, device_ids=dp_device_ids).cuda()
 
     best_prec1, start_epoch = (0, 0)
     if checkpoint:
@@ -347,14 +323,9 @@ def train_model(args, model, loaders, *, checkpoint=None, dp_device_ids=None,
 
 
         def save_checkpoint(filename):
-            # Only save checkpoints on the main process to avoid conflicts
-            if is_main_process():
-                ckpt_save_path = os.path.join(args.out_dir if not store else \
-                                              store.path, filename)
-                ch.save(sd_info, ckpt_save_path, pickle_module=dill)
-            # Ensure all processes wait for checkpoint saving to complete
-            if is_distributed():
-                barrier()
+            ckpt_save_path = os.path.join(args.out_dir if not store else \
+                                          store.path, filename)
+            ch.save(sd_info, ckpt_save_path, pickle_module=dill)
 
         save_its = args.save_ckpt_iters
         should_save_ckpt = (epoch % save_its == 0) and (save_its > 0)
@@ -391,9 +362,8 @@ def train_model(args, model, loaders, *, checkpoint=None, dp_device_ids=None,
                 'time': time.time() - start_time
             }
 
-            # Log info into the logs table (only on main process)
-            if store and is_main_process(): 
-                store[consts.LOGS_TABLE].append_row(log_info)
+            # Log info into the logs table
+            if store: store[consts.LOGS_TABLE].append_row(log_info)
             # If we are at a saving epoch (or the last epoch), save a checkpoint
             if should_save_ckpt or last_epoch: save_checkpoint(ckpt_at_epoch(epoch))
 
@@ -544,37 +514,15 @@ def _model_loop(args, loop_type, loader, model, opt, epoch, adv, writer, scaler)
         if has_attr(args, 'iteration_hook'):
             args.iteration_hook(model, i, loop_type, inp, target)
 
-        # Only update progress bar on main process to avoid cluttered output
-        if is_main_process():
-            iterator.set_description(desc)
-            iterator.refresh()
+        iterator.set_description(desc)
+        iterator.refresh()
 
-    if writer is not None and is_main_process():
+    if writer is not None:
         prec_type = 'adv' if adv else 'nat'
         descs = ['loss', 'top1', 'top5']
-        
-        # Use aggregated values if available
-        if is_distributed():
-            top1_val = reduce_tensor(ch.tensor(top1.avg).cuda()).item()
-            loss_val = reduce_tensor(ch.tensor(losses.avg).cuda()).item()
-            top5_val = reduce_tensor(ch.tensor(top5.avg).cuda()).item()
-            vals = [loss_val, top1_val, top5_val]
-        else:
-            vals = [losses.avg, top1.avg, top5.avg]
-            
+        vals = [losses, top1, top5]
         for d, v in zip(descs, vals):
-            writer.add_scalar('_'.join([prec_type, loop_type, d]), v, epoch)
+            writer.add_scalar('_'.join([prec_type, loop_type, d]), v.avg,
+                              epoch)
 
-    # Aggregate metrics across all processes for distributed training
-    if is_distributed():
-        # Convert to tensors for reduction
-        top1_tensor = ch.tensor(top1.avg).cuda()
-        loss_tensor = ch.tensor(losses.avg).cuda()
-        
-        # Reduce across all processes
-        top1_avg = reduce_tensor(top1_tensor, average=True).item()
-        loss_avg = reduce_tensor(loss_tensor, average=True).item()
-        
-        return top1_avg, loss_avg
-    else:
-        return top1.avg, losses.avg
+    return top1.avg, losses.avg

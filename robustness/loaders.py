@@ -16,6 +16,7 @@ import torch as ch
 import torch.utils.data
 from torch.utils.data import DataLoader
 from torch.utils.data import Subset
+from torch.utils.data.distributed import DistributedSampler
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 from . import imagenet_models as models
@@ -65,7 +66,7 @@ def make_loaders(workers, batch_size, transforms, data_path, data_aug=True,
                 custom_class=None, dataset="", label_mapping=None, subset=None,
                 subset_type='rand', subset_start=0, val_batch_size=None,
                 only_val=False, shuffle_train=True, shuffle_val=True, seed=1,
-                custom_class_args=None):
+                custom_class_args=None, distributed=False, rank=0, world_size=1):
     '''
     **INTERNAL FUNCTION**
 
@@ -135,11 +136,36 @@ def make_loaders(workers, batch_size, transforms, data_path, data_aug=True,
         train_set = Subset(train_set, subset)
 
     if not only_val:
+        # Create distributed samplers if needed
+        train_sampler = None
+        if distributed:
+            train_sampler = DistributedSampler(
+                train_set, 
+                num_replicas=world_size, 
+                rank=rank,
+                shuffle=shuffle_train,
+                seed=seed
+            )
+            shuffle_train = False  # DistributedSampler handles shuffling
+        
         train_loader = DataLoader(train_set, batch_size=batch_size, 
-            shuffle=shuffle_train, num_workers=workers, pin_memory=True)
+            shuffle=shuffle_train, sampler=train_sampler, num_workers=workers, 
+            pin_memory=True, drop_last=True)
 
-    test_loader = DataLoader(test_set, batch_size=val_batch_size, 
-            shuffle=shuffle_val, num_workers=workers, pin_memory=True)
+    # Create distributed sampler for validation if needed
+    val_sampler = None
+    if distributed:
+        val_sampler = DistributedSampler(
+            test_set,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle_val,
+            seed=seed
+        )
+        shuffle_val = False  # DistributedSampler handles shuffling
+
+    test_loader = DataLoader(test_set, batch_size=val_batch_size,
+            shuffle=shuffle_val, sampler=val_sampler, num_workers=workers, pin_memory=True)
 
     if only_val:
         return None, test_loader

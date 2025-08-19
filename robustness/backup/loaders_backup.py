@@ -1,7 +1,7 @@
 import argparse
 
-from . import cifar_models
-from .tools import folder
+from .. import cifar_models
+from ..tools import folder
 
 import os
 if int(os.environ.get("NOTEBOOK_MODE", 0)) == 1:
@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Subset
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
-from . import imagenet_models as models
+from .. import imagenet_models as models
 
 def _load_imagenet_label_mapping(map_file):
     """
@@ -34,6 +34,32 @@ def _load_imagenet_label_mapping(map_file):
                 wnid = parts[0]  # first token is the wnid
                 wnid_to_index[wnid] = idx
     return wnid_to_index
+
+def _create_imagenet_label_mapping_function(wnid_to_index):
+    """
+    Creates a function that maps folder names (classes) to proper ImageNet indices
+    using the wnid_to_index mapping from map_clsloc.txt
+    """
+    def label_mapping_func(classes, class_to_idx):
+        # Create new mappings based on the official ImageNet order
+        new_classes = []
+        new_class_to_idx = {}
+        
+        for folder_name in classes:
+            if folder_name in wnid_to_index:
+                # Use the official ImageNet index
+                official_idx = wnid_to_index[folder_name]
+                new_classes.append(folder_name)
+                new_class_to_idx[folder_name] = official_idx
+            else:
+                print(f"WARNING: Folder {folder_name} not found in map_clsloc.txt")
+                # Fallback to original index if not found
+                new_classes.append(folder_name)
+                new_class_to_idx[folder_name] = class_to_idx[folder_name]
+        
+        return new_classes, new_class_to_idx
+    
+    return label_mapping_func
 
 def make_loaders(workers, batch_size, transforms, data_path, data_aug=True,
                 custom_class=None, dataset="", label_mapping=None, subset=None,
@@ -72,7 +98,8 @@ def make_loaders(workers, batch_size, transforms, data_path, data_aug=True,
             map_file = os.path.join(data_path, 'map_clsloc.txt')
             if os.path.exists(map_file):
                 print(f"Using official ImageNet class order from: {map_file}")
-                label_mapping = _load_imagenet_label_mapping(map_file)
+                wnid_to_index = _load_imagenet_label_mapping(map_file)
+                label_mapping = _create_imagenet_label_mapping_function(wnid_to_index)
             else:
                 print("WARNING: map_clsloc.txt not found; falling back to alphabetical folder order.")
         if not only_val:

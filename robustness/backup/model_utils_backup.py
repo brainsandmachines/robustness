@@ -1,7 +1,4 @@
 import torch as ch
-from torch.nn.parallel import DistributedDataParallel as DDP
-from .tools.distributed_utils import is_distributed, get_rank
-
 from torch import nn
 import dill
 import os
@@ -54,7 +51,7 @@ class DummyModel(nn.Module):
         return self.model(x)
 
 def make_and_restore_model(*_, arch, dataset, resume_path=None,
-         parallel=False, pytorch_pretrained=False, add_custom_forward=False, distributed=None):
+         parallel=False, pytorch_pretrained=False, add_custom_forward=False):
     """
     Makes a model and (optionally) restores it from a checkpoint.
 
@@ -66,8 +63,6 @@ def make_and_restore_model(*_, arch, dataset, resume_path=None,
             robustness library (ignored if ``arch`` is not a string)
         not a string
         parallel (bool): if True, wrap the model in a DataParallel 
-            (ignored if distributed=True)
-        distributed (bool|None): if True, wrap in DDP; if None, auto-detect 
             (defaults to False)
         pytorch_pretrained (bool): if True, try to load a standard-trained 
             checkpoint from the torchvision library (throw error if failed)
@@ -113,22 +108,9 @@ def make_and_restore_model(*_, arch, dataset, resume_path=None,
         error_msg = "=> no checkpoint found at '{}'".format(resume_path)
         raise ValueError(error_msg)
 
-    # Handle parallel/distributed model wrapping
-    if distributed is None:
-        distributed = is_distributed()
-    
-    if distributed:
-        # DDP mode: move to specific device first, then wrap
-        if ch.cuda.is_available():
-            device_id = get_rank()
-            model = model.cuda(device_id)
-            model = DDP(model, device_ids=[device_id])
-    elif parallel:
-        # DataParallel fallback
+    if parallel:
         model = ch.nn.DataParallel(model)
-        if ch.cuda.is_available():
-            model = model.cuda()
-    elif ch.cuda.is_available():
+    if ch.cuda.is_available():
         model = model.cuda()
 
     return model, checkpoint
