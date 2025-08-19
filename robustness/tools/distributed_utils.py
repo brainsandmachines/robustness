@@ -18,7 +18,7 @@ def setup_distributed(rank, world_size, backend='nccl'):
         world_size (int): Total number of processes
         backend (str): Communication backend ('nccl' for GPU, 'gloo' for CPU)
     """
-    os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', 'localhost')
+    os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', '127.0.0.1')
     os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '12355')
     
     # Initialize the process group
