@@ -120,9 +120,9 @@ def make_and_restore_model(*_, arch, dataset, resume_path=None,
     if distributed:
         # DDP mode: move to specific device first, then wrap
         if ch.cuda.is_available():
-            device_id = get_rank()
-            model = model.cuda(device_id)
-            model = DDP(model, device_ids=[device_id])
+            device_id = ch.cuda.current_device()
+            model = model.to(device_id)
+            model = DDP(model, device_ids=[device_id], output_device=device_id)
     elif parallel:
         # DataParallel fallback
         model = ch.nn.DataParallel(model)
