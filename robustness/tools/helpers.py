@@ -101,11 +101,13 @@ class InputNormalize(ch.nn.Module):
         return x_normalized
 
 class DataPrefetcher():
-    def __init__(self, loader, stop_after=None):
+    def __init__(self, loader, stop_after=None, device=None):
         self.loader = loader
         self.dataset = loader.dataset
-        self.stream = ch.cuda.Stream()
         self.stop_after = stop_after
+        self.device = ch.cuda.current_device() if device is None else device
+        with ch.cuda.device(self.device):
+            self.stream = ch.cuda.Stream()
         self.next_input = None
         self.next_target = None
 
@@ -119,7 +121,7 @@ class DataPrefetcher():
             self.next_input = None
             self.next_target = None
             return
-        with ch.cuda.stream(self.stream):
+        with ch.cuda.device(self.device), ch.cuda.stream(self.stream):
             self.next_input = self.next_input.cuda(non_blocking=True)
             self.next_target = self.next_target.cuda(non_blocking=True)
 
@@ -128,13 +130,14 @@ class DataPrefetcher():
         self.loaditer = iter(self.loader)
         self.preload()
         while self.next_input is not None:
-            ch.cuda.current_stream().wait_stream(self.stream)
+            with ch.cuda.device(self.device):
+                ch.cuda.current_stream().wait_stream(self.stream)
             input = self.next_input
             target = self.next_target
             self.preload()
             count += 1
             yield input, target
-            if type(self.stop_after) is int and (count > self.stop_after):
+            if isinstance(self.stop_after, int) and (count > self.stop_after):
                 break
 
 class AverageMeter(object):

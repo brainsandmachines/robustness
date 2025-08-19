@@ -8,33 +8,37 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+def setup_distributed(rank: int, world_size: int, backend: str = "nccl", init_method: str = "env://") -> None:
+    """
+    Initialize the distributed environment for this process.
+    Call this BEFORE any CUDA ops (streams, tensors, DataPrefetcher, etc).
+    """
+    # 1 Pick device deterministically (one GPU per rank) *before* any CUDA call
+    if backend == "nccl":
+        assert ch.cuda.is_available(), "NCCL backend requires CUDA."
+        # use LOCAL_RANK if present (torchrun), otherwise fall back to our spawn rank
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        device_id = local_rank % ch.cuda.device_count()
+        ch.cuda.set_device(device_id)
 
-def setup_distributed(rank, world_size, backend='nccl'):
-    """
-    Initialize the distributed environment.
-    
-    Args:
-        rank (int): Rank of the current process
-        world_size (int): Total number of processes
-        backend (str): Communication backend ('nccl' for GPU, 'gloo' for CPU)
-    """
-    # Set environment variables for master node
-    os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', '127.0.0.1')
-    os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '12355')
-    
-    # Set the GPU device for this process (1 GPU per rank)
-    if ch.cuda.is_available() and backend == 'nccl':
-        ch.cuda.set_device(rank % ch.cuda.device_count())
-    
-    # Initialize the process group (env:// uses MASTER_ADDR/MASTER_PORT)
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-    
-    # Tiny all_reduce sanity check (catches mis-mapping immediately)
-    if ch.cuda.is_available() and backend == 'nccl':
+    # 2 Initialize the process group.
+    #    Do NOT set MASTER_ADDR/MASTER_PORT here; let the launcher/env control that.
+    dist.init_process_group(
+        backend=backend,
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+    )
+
+    # 3 Fast sanity check to catch bad rank↔GPU mapping
+    if backend == "nccl":
         t = ch.tensor([rank], device=ch.cuda.current_device())
-        dist.all_reduce(t)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        expected = world_size * (world_size - 1) // 2
         if rank == 0:
-            print(f"[DDP] all_reduce ok: sum={t.item()} expected={sum(range(world_size))} on device {ch.cuda.current_device()}")
+            print(f"[DDP] all_reduce ok: sum={t.item()} expected={expected} "
+                  f"on device {ch.cuda.current_device()}")
+
 
 
 def cleanup_distributed():
